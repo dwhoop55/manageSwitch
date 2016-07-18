@@ -1,7 +1,7 @@
 #!/bin/bash
 #title          :ramnet_HP_ProCurve_2484_Switch_Manager
 #description    :Script zum Management unserer HP 2848 Switche
-#author         :Florian Busch (busch.florian@ram.rwth-aachen.de)
+#author         :Florian Busch (florian.busch@ram.rwth-aachen.de)
 #date           :20150514
 #version        :0.4
 VERSION=0.4
