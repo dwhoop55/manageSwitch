@@ -59,12 +59,15 @@ Search for ```# GIT: EDIT HERE ``` and edit to make it work for your infrastruct
 *   -h       Show this message
 *   -f       Force, do not ask for confirmation. MAKE SURE YOU KNOW WHAT YOU DO!
 *   -s       The switch to manage:
-*       swSample1        | Sample switch 1
+
+        swSample1        | Sample switch 1
         swSample2        | Sample switch 2
 *   -p       The port to manage:
-*       1-46 (since 47 and 48 are uplinks)
+        
+        1-46 (since 47 and 48 are uplinks)
 *   -a       The action on the port
-*       getState    |(get the current state of a port)
+
+        getState    |(get the current state of a port)
         up          |(set adminStatus to up (1))
         down        |(set adminStatus to down (2))
         unSetFlag   |(set intrusionFlag to unset (2), 1=set)
@@ -75,17 +78,21 @@ Search for ```# GIT: EDIT HERE ``` and edit to make it work for your infrastruct
         searchIP    |(requires -i to be set!)
         ipToMAC     |(requires -i to be set!)
 *   -n       The new VLAN for the port (define your own):
-*       1000         |(user vlan [Will be set if no -n argument])
+
+        1000         |(user vlan [Will be set if no -n argument])
         1200         |(admin vlan)
         1300         |(blocked vlan)
 *   -g       The new interface speed (in Mbit/s):
-*       10          |(Mbit/s)
+        
+        10          |(Mbit/s)
         100         |(Mbit/s [Will be set if no -g argument])
         1000        |(Mbit/s)
 *   -m       The MAC address in the format:
-*       "AA:BB:Cc:DD:eE:DD"  or  "Aa-Bb-CC-DD-EE-DD"
+        
+        "AA:BB:Cc:DD:eE:DD"  or  "Aa-Bb-CC-DD-EE-DD"
 *   -i       The IP address in the format:
-*       "192.168.0.123"
+        
+        "192.168.0.123"
 *   -b       Provide output in program friendly form
 
 Now you can start using the script.
