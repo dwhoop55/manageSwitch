@@ -46,8 +46,8 @@ Make sure they are in the PATH variable or manually set in the script.
 ## Installation
 
 ```bash
-$ git clone https://github.com/dwhoop55/switchManager-hp2848.git
-$ cd ./switchManager-hp2848
+$ git clone https://github.com/dwhoop55/manageSwitch.git
+$ cd ./manageSwitch
 $ chmod +x ./manageSwitch
 ```
 
