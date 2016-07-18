@@ -1,0 +1,1180 @@
+#!/bin/bash
+#title          :ramnet_HP_ProCurve_2484_Switch_Manager
+#description    :Script zum Management unserer HP 2848 Switche
+#author         :Florian Busch (busch.florian@ram.rwth-aachen.de)
+#date           :20150514
+#version        :0.4
+VERSION=0.4
+#usage          :./manageSwitch -s <switch> -p <port> -a <action> -n <vlan> -g <speed> -m <mac> -i <ip> -f -b
+#notes          :
+#bash_version   :3.2.51(1)-release
+#============================================================================
+
+# Definitions (NO WHITESPACE!)
+ # Switches
+ # GIT: EDIT HERE (set your switch IPs)
+  SWC4K="192.168.1.1"
+  SWSAMPLE1="10.10.9.42"
+  SWSAMPLE2="10.10.9.43"
+
+ # SNMP defs
+  SNMPGETBIN="snmpget"
+  SNMPSETBIN="snmpset"
+  SNMPWALKBIN="snmpwalk"
+  # GIT: EDIT HERE (set SNMP communities and passwords)
+  SNMPUSER="snmpv3user"
+  SNMPPWD="authpass"
+  SNMPPRIVPWD="privpass"
+  SNMPCOM="public"
+# OIDs
+  # ip mac search
+  OIDCISCOARPTABLE=".1.3.6.1.2.1.3.1.1.2.38.1"
+  # mac port search
+  OIDMACTABLE=".1.3.6.1.2.1.17.4.3.1.1"
+  OIDBRTABLE=".1.3.6.1.2.1.17.4.3.1.2."
+  OIDIFINDEXTABLE=".1.3.6.1.2.1.17.1.4.1.2."
+  OIDIFNAMETABLE=".1.3.6.1.2.1.31.1.1.1.1."
+  # port management
+  OIDADMINSTATUS="1.3.6.1.2.1.2.2.1.7."
+  OIDOPERSTATUS="1.3.6.1.2.1.2.2.1.8."
+  OIDINTRUSIONFLAG="1.3.6.1.4.1.11.2.14.2.10.3.1.7.1."
+
+  OIDSPEED="1.3.6.1.2.1.31.1.1.1.15."
+  OIDSPEEDWRITE="1.3.6.1.4.1.11.2.14.11.5.1.7.1.3.1.1.10." # + Port
+    #Change speed and duplex by setting the following parameters to OID 1.3.6.1.4.1.11.2.14.11.5.1.7.1.3.1.1.10.ifindex :
+        # 1: half-duplex-10Mbits(1)
+        # 2: half-duplex-100Mbits(2)
+        # 3: full-duplex-10Mbits(3)
+        # 4: full-duplex-100Mbits(4)
+        # 5: auto-neg(5)                                        -> default for uplink and 1gbit for user
+        # 6: force 1Gb
+        # 7: force 10Mb, auto duplex            -> default for slow 10Mbit/s
+        # 8: force 100Mb, auto duplex/flow   -> default for users
+        # 9: force 1Gb, auto flow control
+        # 10: force 10Gb
+        # 11: force auto 10/100 speed and auto duplex
+        # Use option 11 to disable gigabit capability on 10/100/1000 ports but still enable auto-negotiation
+  VAR10TFD="7"
+  VAR100TXFD="8"
+  VAR1000TXFD="5"
+
+  OIDVLAN="1.3.6.1.2.1.17.7.1.4.5.1.1."
+  SNMPGETARGS="-v3 -l authPriv -u $SNMPUSER -a MD5 -x DES -A $SNMPPWD -X $SNMPPRIVPWD"
+ # Color defs
+  RESTORE='\033[0m'
+  RED='\033[00;31m'
+  GREEN='\033[00;32m'
+  YELLOW='\033[00;33m'
+  BLUE='\033[00;34m'
+  PURPLE='\033[00;35m'
+  CYAN='\033[00;36m'
+  LIGHTGRAY='\033[00;37m'
+
+usage()
+{
+
+# GIT: EDIT HERE (edit the help page, put in your VLANs, switch names, ..)
+cat << EOF
+usage: $0 options
+
+This script will manage our HP ProCurve 2484 switches.
+You can change interface status (up, down), set a
+VLAN  set the interface speed or reset an intrusion flag.
+Since v0.3 you can search all switches for a given
+mac address. It will return the switch and port.
+
+OPTIONS:
+   -h       Show this message
+   -f       Force, do not ask for confirmation. MAKE SURE YOU KNOW WHAT YOU DO!
+   -s       The switch to manage:
+             swSample1        | Sample switch 1
+             swSample2        | Sample switch 2
+   -p       The port to manage:
+             1-46 (since 47 and 48 are uplinks)
+   -a       The action on the port
+             getState    |(get the current state of a port)
+             up          |(set adminStatus to up (1))
+             down        |(set adminStatus to down (2))
+             unSetFlag   |(set intrusionFlag to unset (2), 1=set)
+             # Unsupported by Switch # setFlag     |(set intrusionFlag to set (1), 2=unset)
+             setVLAN     |(requires -n to be set!)
+             setSpeed    |(requires -g to be set!)
+             searchMAC   |(requires -m to be set!)
+             searchIP    |(requires -i to be set!)
+             ipToMAC     |(requires -i to be set!)
+   -n       The new VLAN for the port:
+             1000         |(user vlan [Will be set if no -n argument])
+             1200         |(admin vlan)
+             1300         |(blocked vlan)
+   -g       The new interface speed (in Mbit/s):
+             10          |(Mbit/s)
+             100         |(Mbit/s [Will be set if no -g argument])
+             1000        |(Mbit/s)
+   -m       The MAC address in the format:
+             "AA:BB:Cc:DD:eE:DD"  or  "Aa-Bb-CC-DD-EE-DD"
+   -i       The IP address in the format:
+             "192.168.0.123"
+   -b       Provide output in program friendly form
+EOF
+}
+
+setSpeed()
+# First we will bring the port down
+# Then set the new Port Speed and finally
+# bring the port back up (if it was up before)
+{
+        GETOPER=1
+        GETSPEED=1
+        GETADMIN=1
+        GETINTRUSION=0
+        GETVLAN=0
+        getPortState
+
+        # Check if the arg given is 10/100/1000
+        if [[ $NEWSPEEDWORD != "10" ]] && [[ $NEWSPEEDWORD != "100" ]] && [[ $NEWSPEEDWORD != "1000" ]];
+                then
+                        # setting speed to 100MBit/s since none found or invalid
+                        NEWSPEED=$VAR100TXFD
+                        NEWSPEEDWORD=100
+                        if [[ $BASHFRIENDLY == 1 ]]
+                        then
+                                echo "no -g -> set to 100Mbit/s"
+                        else
+                                echo -e "${YELLOW}No Speed specified in -g. Setting Speed to 100Mbit/s${RESTORE}"
+                        fi
+        fi
+
+        # Check if interface is up or down, to ensure it is at the
+        # right state after the Speedchange
+        ADMINSTATUS=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT}`
+                if [[ $ADMINSTATUS =~ .*INTEGER:\ 1.* ]]
+                then
+                        # 1 is up
+                        OLDADMINSTATUS=1
+                else
+                        # 2 is down
+                        OLDADMINSTATUS=2
+                fi
+
+        if [[ $NEWSPEEDWORD == "100" ]]
+        then
+                NEWSPEED=$VAR100TXFD
+        elif [[ $NEWSPEEDWORD == "1000" ]]
+        then
+            NEWSPEED=$VAR1000TXFD
+        else
+                NEWSPEED=$VAR10TFD
+        fi
+
+        if [[ $FORCE != 1 ]];
+        then
+                read -p "This will change the Speed of Port $PORT to ${NEWSPEEDWORD}Mbit/s. Are you sure? [y/n]" -n 1 -r
+                echo    # (optional) move to a new line
+                if [[ $REPLY =~ ^[Yy]$ ]]
+                then
+                  CONFIRMED=1
+                fi
+        else
+                CONFIRMED=1
+        fi
+        if [[ $CONFIRMED == 1 ]]; then
+                # 2 means unset, 1 means set
+                RESULT=`${SNMPSETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDSPEEDWRITE}${PORT} i ${NEWSPEED}`
+                if [[ $RESULT =~ .*INTEGER:\ .* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "success"
+                                        FAILED=0
+                                else
+                                        echo -e "${GREEN}Success: Port ${PORT} is now at ${NEWSPEEDWORD}Mbit/s${RESTORE}"
+                                        FAILED=0
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "failed"
+                                        FAILED=1
+                                else
+                                        echo -e "${RED}Failed: Something went wrong!${RESULT}${RESTORE}"
+                                        FAILED=1
+                                fi
+                fi
+        else
+                echo "Abort. Nothing has been changed."
+                exit 1
+        fi
+
+        GETOPER=1
+        GETSPEED=1
+        GETADMIN=1
+        GETINTRUSION=0
+        GETVLAN=0
+        getPortState
+
+        if [[ $FAILED == 1 ]]; then
+                exit 0
+        else
+                exit 1
+        fi
+}
+
+setVLAN()
+# First we will bring the port down
+# Then set the new VLAN and finally
+# bring the port back up (if it was up before)
+{
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=0
+        GETVLAN=1
+        getPortState
+
+        if [[ -z $NEWVLAN ]]; then
+                # setting vlan to 101 since none found
+                NEWVLAN=101
+                if [[ $BASHFRIENDLY == 1 ]]
+                then
+                        echo "no -n -> set to 101"
+                else
+                        echo -e "${YELLOW}No VLAN specified in -n. Setting VLAN to 101 (users)${RESTORE}"
+                fi
+        fi
+
+        # Check if interface is up or down, to ensure it is at the
+        # right state after the VLAN change
+        ADMINSTATUS=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT}`
+                if [[ $ADMINSTATUS =~ .*INTEGER:\ 1.* ]]
+                then
+                        # 1 is up
+                        OLDADMINSTATUS=1
+                else
+                        # 2 is down
+                        OLDADMINSTATUS=2
+                fi
+
+        if [[ $FORCE != 1 ]];
+        then
+                read -p "This will move Port $PORT to VLAN $NEWVLAN. Are you sure? [y/n]" -n 1 -r
+                echo    # (optional) move to a new line
+                if [[ $REPLY =~ ^[Yy]$ ]]
+                then
+                  CONFIRMED=1
+                fi
+        else
+                CONFIRMED=1
+        fi
+        if [[ $CONFIRMED == 1 ]]; then
+                # First bring down the interface
+                if [[ FORCE == 1 ]]; then
+                        FORCE=1
+                        SHOWCURRENT=0
+                        # DORETURN will force the subfuntion to return and not exit
+                        DORETURN=1
+                        setPortDown
+                else
+                        FORCE=1
+                        SHOWCURRENT=0
+                        # DORETURN will force the subfuntion to return and not exit
+                        DORETURN=1
+                        setPortDown
+                        FORCE=0
+                fi
+                # 2 means unset, 1 means set
+                RESULT=`${SNMPSETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDVLAN}${PORT} u ${NEWVLAN}`
+                if [[ $RESULT =~ .*Gauge32:\ .* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "success"
+                                        FAILED=0
+                                else
+                                        echo -e "${GREEN}Success: Port ${PORT} is now in VLAN ${NEWVLAN}${RESTORE}"
+                                        FAILED=0
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "failed"
+                                        FAILED=1
+                                else
+                                        echo -e "${RED}Failed: Something went wrong!${RESULT}${RESTORE}"
+                                        FAILED=1
+                                fi
+                fi
+        else
+                echo "Abort. Nothing has been changed."
+                exit 1
+        fi
+
+        if [[ $OLDADMINSTATUS == 1 ]];
+        then
+                # We are here if the interface has been up before
+                if [[ FORCE == 1 ]]; then
+                        FORCE=1
+                        SHOWCURRENT=0
+                        DORETURN=1
+                        setPortUp
+                else
+                        FORCE=1
+                        SHOWCURRENT=0
+                        setPortUp
+                        DORETURN=1
+                        FORCE=0
+                fi
+        fi
+
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=0
+        GETVLAN=1
+        getPortState
+
+        if [[ $FAILED == 1 ]]; then
+                exit 0
+        else
+                exit 1
+        fi
+}
+
+unSetFlag()
+# First we will bring the port down
+# Then unset the flag and finally
+# bring the port back up
+{
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=1
+        GETVLAN=0
+        getPortState
+
+        # Check if interface is up or down, to ensure it is at the
+        # right state after the unSetting of the flag
+        ADMINSTATUS=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT}`
+                if [[ $ADMINSTATUS =~ .*INTEGER:\ 1.* ]]
+                then
+                        # 1 is up
+                        OLDADMINSTATUS=1
+                else
+                        # 2 is down
+                        OLDADMINSTATUS=2
+                fi
+
+        if [[ $FORCE != 1 ]];
+        then
+                read -p "This will unset the IntrusionFlag on Port $PORT. Are you sure? [y/n]" -n 1 -r
+                echo    # (optional) move to a new line
+                if [[ $REPLY =~ ^[Yy]$ ]]
+                then
+                  CONFIRMED=1
+                fi
+        else
+                CONFIRMED=1
+        fi
+        if [[ $CONFIRMED == 1 ]]; then
+                # First bring down the interface
+                if [[ FORCE == 1 ]]; then
+                        FORCE=1
+                        SHOWCURRENT=0
+                        # DORETURN will force the subfunction to return and not exit
+                        DORETURN=1
+                        setPortDown
+                else
+                        FORCE=1
+                        SHOWCURRENT=0
+                        # DORETURN will force the subfunction to return and not exit
+                        DORETURN=1
+                        setPortDown
+                        FORCE=0
+                fi
+                # 2 means unset, 1 means set
+                RESULT=`${SNMPSETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDINTRUSIONFLAG}${PORT} i 2`
+                if [[ $RESULT =~ .*INTEGER:\ 2.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "success"
+                                        FAILED=0
+                                else
+                                        echo -e "${GREEN}Success: IntrusionFlag is now unset${RESTORE}"
+                                        FAILED=0
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "failed"
+                                        FAILED=1
+                                else
+                                        echo -e "${RED}Failed: IntrusionFlag is still set${RESTORE}"
+                                        FAILED=1
+                                fi
+                fi
+        else
+                echo "Abort. Nothing has been changed."
+                exit 1
+        fi
+
+ # After a unsetFlag interface is still down - setUp:
+        if [[ FORCE == 1 ]]; then
+                FORCE=1
+                SHOWCURRENT=0
+                DORETURN=1
+                setPortUp
+        else
+                FORCE=1
+                SHOWCURRENT=0
+                setPortUp
+                DORETURN=1
+                FORCE=0
+        fi
+
+
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=1
+        GETVLAN=0
+        getPortState
+
+        if [[ $FAILED == 1 ]]; then
+                exit 0
+        else
+                exit 1
+        fi
+}
+
+setFlag()
+# First we will bring the port down
+# Then unset the flag and finally
+# bring the port back up
+{
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=1
+        GETVLAN=0
+        getPortState
+
+        # Check if interface is up or down, to ensure it is at the
+        # right state after the unSetting of the flag
+        ADMINSTATUS=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT}`
+                if [[ $ADMINSTATUS =~ .*INTEGER:\ 1.* ]]
+                then
+                        # 1 is up
+                        OLDADMINSTATUS=1
+                else
+                        # 2 is down
+                        OLDADMINSTATUS=2
+                fi
+
+        if [[ $FORCE != 1 ]];
+        then
+                read -p "This will set (!) the IntrusionFlag on Port $PORT. Are you sure? [y/n]" -n 1 -r
+                echo    # (optional) move to a new line
+                if [[ $REPLY =~ ^[Yy]$ ]]
+                then
+                  CONFIRMED=1
+                fi
+        else
+                CONFIRMED=1
+        fi
+        if [[ $CONFIRMED == 1 ]]; then
+                # First bring down the interface
+                if [[ FORCE == 1 ]]; then
+                        FORCE=1
+                        SHOWCURRENT=0
+                        # DORETURN will force the subfuntion to return and not exit
+                        DORETURN=1
+                        setPortDown
+                else
+                        FORCE=1
+                        SHOWCURRENT=0
+                        # DORETURN will force the subfuntion to return and not exit
+                        DORETURN=1
+                        setPortDown
+                        FORCE=0
+                fi
+                # 2 means unset, 1 means set
+                RESULT=`${SNMPSETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDINTRUSIONFLAG}${PORT} i 1`
+                if [[ $RESULT =~ .*INTEGER:\ 1.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "success"
+                                        FAILED=0
+                                else
+                                        echo -e "${GREEN}Success: IntrusionFlag is now set (!)${RESTORE}"
+                                        FAILED=0
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "failed"
+                                        FAILED=1
+                                else
+                                        echo -e "${RED}Failed: IntrusionFlag is still unset${RESTORE}"
+                                        FAILED=1
+                                fi
+                fi
+        else
+                echo "Abort. Nothing has been changed."
+                exit 1
+        fi
+
+        if [[ $OLDADMINSTATUS == 1 ]];
+        then
+                # We are here if the interface has been up before
+                if [[ FORCE == 1 ]]; then
+                        FORCE=1
+                        SHOWCURRENT=0
+                        DORETURN=1
+                        setPortUp
+                else
+                        FORCE=1
+                        SHOWCURRENT=0
+                        setPortUp
+                        DORETURN=1
+                        FORCE=0
+                fi
+        fi
+
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=1
+        GETVLAN=0
+        getPortState
+
+        if [[ $FAILED == 1 ]]; then
+                exit 0
+        else
+                exit 1
+        fi
+}
+
+setPortUp()
+# This will bring an interface up.
+# If SHOWCURRENT (=1) is set, a short summary of the Port
+# Will be shown first
+{
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=0
+        GETVLAN=0
+        if [[ SHOWCURRENT == 1 ]];
+        then
+                getPortState
+        fi
+
+        if [[ $FORCE != 1 ]];
+        then
+                read -p "This will set Port $PORT to up. Are you sure? [y/n]" -n 1 -r
+                echo    # (optional) move to a new line
+                if [[ $REPLY =~ ^[Yy]$ ]]
+                then
+                  CONFIRMED=1
+                fi
+        else
+                CONFIRMED=1
+        fi
+        if [[ $CONFIRMED == 1 ]]; then
+                RESULT=`${SNMPSETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT} i 1`
+                if [[ $RESULT =~ .*INTEGER:\ 1.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "success"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 1
+                                        fi
+                                else
+                                        echo -e "${GREEN}Success: Port is now up${RESTORE}"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 1
+                                        fi
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "failed"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 0
+                                        fi
+                                else
+                                        echo -e "${RED}Failed: Port is still down${RESTORE}"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 0
+                                        fi
+                                fi
+                fi
+        else
+                echo "Abort. Nothing has been changed."
+                exit 1
+        fi
+}
+
+setPortDown()
+# This will bring an interface up.
+# If SHOWCURRENT (=1) is set, a short summary of the Port
+# Will be shown first
+# If DORETURN (=1) is set, then the script knows its being
+# run as a subfunction. It will then return even if it fails.
+# It will also be less verbose
+{
+        GETOPER=1
+        GETSPEED=0
+        GETADMIN=1
+        GETINTRUSION=0
+        GETVLAN=0
+        if [[ SHOWCURRENT == 1 ]];
+        then
+                getPortState
+        fi
+
+        if [[ $FORCE != 1 ]];
+        then
+                read -p "This will set Port $PORT to down. Are you sure? [y/n]" -n 1 -r
+                echo    # (optional) move to a new line
+                if [[ $REPLY =~ ^[Yy]$ ]]
+                then
+                  CONFIRMED=1
+                fi
+        else
+                CONFIRMED=1
+        fi
+        if [[ $CONFIRMED == 1 ]]; then
+                # 1 means up and 2 means down
+                RESULT=`${SNMPSETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT} i 2`
+                if [[ $RESULT =~ .*INTEGER:\ 2.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "success"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 1
+                                        fi
+                                else
+                                        echo -e "${GREEN}Success: Port is now down${RESTORE}"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 1
+                                        fi
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        echo "failed"
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 0
+                                        fi
+                                else
+                                        echo -e "${RED}Failed: Port is still up${RESTORE}"
+                                        getPortState
+                                        if [[ $DORETURN != 1 ]]; then
+                                                sleep 1
+                                                getPortState
+                                                exit 0
+                                        fi
+                                fi
+                fi
+        else
+                echo "Abort. Nothing has been changed."
+                exit 1
+        fi
+}
+
+macToIp () {
+  local mac=`echo $1 | sed s'/:/\ /'g | sed s'/-/\ /'g | awk '{print toupper($0)}'`
+  local ip=`$SNMPWALKBIN -v2c -c $SNMPCOM -O xqn $SWC4K $OIDCISCOARPTABLE | grep "$mac" | sed s'/.1.3.6.1.2.1.3.1.1.2.38.1.//'g | grep -oE '((1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])'`
+  echo "$ip"
+}
+
+findPortForMacOnSwitch () {
+ mac=`echo $2 | sed s'/:/\ /'g | sed s'/-/\ /'g | awk '{print toupper($0)}'`
+ ip=$1
+ SNMPWALKCALL="$SNMPWALKBIN -v3 -l authPriv -u $SNMPUSER -a MD5 -x DES -A $SNMPPWD -X $SNMPPRIVPWD -Ofn $ip:161"
+
+ first=`$SNMPWALKCALL $OIDMACTABLE 2>/dev/null | grep "$mac" | cut -d= -f 1 | cut -d. -f 13-`
+
+ if [ -n "$first" ]; then
+  Bridge=`$SNMPWALKCALL $OIDBRTABLE$first | cut -d" " -f4`
+  ifIndex=`$SNMPWALKCALL $OIDIFINDEXTABLE$Bridge | cut -d" " -f4`
+  ifName=`$SNMPWALKCALL $OIDIFNAMETABLE$ifIndex | cut -d" " -f4 | sed s'/"//'g`
+  echo `echo $mac | tr -s " " ":"`" "$ip" "$ifName
+ fi
+}
+
+checkMacResult () {
+  TMP_RES=$1
+  TMP_SWITCHIP=$2
+    if [[ "$TMP_RES" != *"$TMP_SWITCHIP 48"* ]] && [[ -n "$TMP_RES" ]];
+    then
+      return 0
+    else
+      return 1
+    fi
+}
+
+searchMAC()
+# This will search for an given MAC address on all switches
+{
+if [[ -n $1 ]]; then
+  MACADDR=$1
+fi
+
+
+ # Instead of asking every switch it would be smarter to
+ # ask the c4k first, giving us the interface of the switch
+ # with the mac on one of its ports
+ # - well - or we just ask all.. ;)
+
+ echo "This may take a while. Searching..."
+ # GIT: EDIT HERE (add your switch names)
+ for TMP_SWITCHIP in "$SWSAMPLE1" "$SWSAMPLE2"
+ do
+  if [[ -n $TMP_SWITCHIP ]]; then
+    TMP_RES=`findPortForMacOnSwitch "$TMP_SWITCHIP" "$MACADDR"`
+    if `checkMacResult "$TMP_RES" "$TMP_SWITCHIP"`; then
+      PORT=`echo $TMP_RES | cut -d" " -f3`
+      SWITCHIP="$TMP_SWITCHIP"
+      RES="$TMP_RES"
+      if [[ $BASHFRIENDLY == 1 ]]
+      then
+        echo "found on $TMP_SWITCHIP"
+      else
+        echo "$TMP_SWITCHIP knows $MACADDR - looking at other switches.."
+      fi
+    fi
+  fi
+ done
+
+  if [[ "$SWITCHIP" == *"?"* ]]; then
+    # not found
+    if [[ $BASHFRIENDLY == 1 ]]; then
+      echo "Failed. Not Found"
+    else
+      echo "Sorry, the MAC address $MACADDR could not be found."
+    fi
+   else
+    # success
+    IP=$(macToIp $MACADDR)
+     if [[ $BASHFRIENDLY == 1 ]]; then
+      echo "$RES"
+      getPortState "$SWITCHIP" "$PORT"
+    else
+      echo "Success! Found MAC address ($MACADDR - IP:$IP) on Switch $SWITCHIP on interface $PORT"
+      echo "Interface details:"
+      getPortState "$SWITCHIP" "$PORT"
+    fi
+  fi
+}
+
+ipToMAC () {
+  ip=$1
+  local mac=`$SNMPWALKBIN -v2c -c $SNMPCOM -O xqn $SWC4K $OIDCISCOARPTABLE."$ip" | cut -d\" -f 2 | sed s'/\ /:/'g | rev | cut -c 2- | rev`
+  echo "$mac"
+}
+
+searchIP () {
+# This will search for an given IP address on all switches
+ TMP_IP=$IPADDR
+ TMP_MAC=$(ipToMAC $TMP_IP)
+ echo "$IPADDR -> $TMP_MAC"
+ if [[ -z $TMP_MAC ]]; then
+   if [[ $BASHFRIENDLY == 1 ]]; then
+        echo "Failed. No ip-to-mac mapping found."
+      else
+        echo "Sorry, the IP address could not be resolved to a mac address"
+      fi
+   exit
+ fi
+
+ searchMAC "$TMP_MAC"
+}
+
+
+getPortState()
+# Pulls the information of a specified port.
+# Note that one can define GETADMIN, GETOPER,
+# GETINTRUSION, GETSPEED, GETVLAN (=1), to
+# get only the desired data
+{
+  if [[ -n $1 ]]; then
+    SWITCHIP=$1
+    PORT=$2
+    GETOPER=1
+    GETSPEED=1
+    GETADMIN=1
+    GETINTRUSION=1
+    GETVLAN=1
+  fi
+
+        if [[ $GETADMIN == 1 ]]
+        then
+                ADMINSTATUS=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDADMINSTATUS}${PORT}`
+                if [[ $ADMINSTATUS =~ .*INTEGER:\ .*1.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        ADMINSTATUS="up"
+                                else
+                                        ADMINSTATUS="${GREEN}up (1)${RESTORE}"
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        ADMINSTATUS="down"
+                                else
+                                        ADMINSTATUS="${RED}down (2)${RESTORE}"
+                                fi
+                fi
+        fi
+
+        if [[ $GETOPER == 1 ]]
+        then
+                OPERSTATUS=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDOPERSTATUS}${PORT}`
+                if [[ $OPERSTATUS =~ .*INTEGER:\ .*1.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        OPERSTATUS="up"
+                                else
+                                        OPERSTATUS="${GREEN}up (1)${RESTORE}"
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        OPERSTATUS="down"
+                                else
+                                        OPERSTATUS="${RED}down (2)${RESTORE}"
+                                fi
+                fi
+        fi
+
+        if [[ $GETINTRUSION == 1 ]]
+        then
+                INTRUSIONFLAG=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDINTRUSIONFLAG}${PORT}`
+                if [[ $INTRUSIONFLAG =~ .*INTEGER:\ 2.* ]]
+                        then
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        INTRUSIONFLAG="no"
+                                else
+                                        INTRUSIONFLAG="${GREEN}not set (2)${RESTORE}"
+                                fi
+                        else
+                                if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        INTRUSIONFLAG="yes"
+                                else
+                                        INTRUSIONFLAG="${RED}set (1)${RESTORE}"
+                                fi
+                fi
+        fi
+
+        if [[ $GETSPEED == 1 ]]
+        then
+                # first we pull the oper speed
+            SPEED=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDSPEED}${PORT}`
+                if [[ $SPEED =~ .*Gauge32:\ 10000.* ]]
+                        then
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        SPEED="10000"
+                                else
+                                        SPEED="${YELLOW}10 Gbit/s${RESTORE}"
+                                fi
+                elif [[ $SPEED =~ .*Gauge32:\ 1000.* ]]
+                        then
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        SPEED="1000"
+                                else
+                                        SPEED="${YELLOW}1 Gbit/s${RESTORE}"
+                                fi
+                elif [[ $SPEED =~ .*Gauge32:\ 100.* ]]
+                        then
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        SPEED="100"
+                                else
+                                        SPEED="${GREEN}100 Mbit/s${RESTORE}"
+                                fi
+                        else
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        SPEED="10"
+                                else
+                                        SPEED="${GREEN}10 Mbit/s${RESTORE}"
+                                fi
+                fi
+                # now get the admin speed
+                ADMINSPEED=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDSPEEDWRITE}${PORT}`
+                if [[ $ADMINSPEED =~ .*INTEGER:\ 5.* ]]
+                        then
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        ADMINSPEED="auto-neg."
+                                else
+                                        ADMINSPEED="${YELLOW}Auto-neg.${RESTORE}"
+                                fi
+                elif [[ $ADMINSPEED =~ .*INTEGER:\ 8.* ]]
+                        then
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        ADMINSPEED="100"
+                                else
+                                        ADMINSPEED="${GREEN}100 Mbit/s force${RESTORE}"
+                                fi
+                elif [[ $ADMINSPEED =~ .*INTEGER:\ 7.* ]]
+                        then
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        ADMINSPEED="10"
+                                else
+                                        ADMINSPEED="${GREEN}10 Mbit/s force${RESTORE}"
+                                fi
+                        else
+                        if [[ $BASHFRIENDLY == 1 ]]
+                                then
+                                        ADMINSPEED="other"
+                                else
+                                        ADMINSPEED="${GREEN}other${RESTORE}"
+                                fi
+                fi
+        fi
+
+        if [[ $GETVLAN == 1 ]]
+        then
+            VLANRAW=`${SNMPGETBIN} ${SNMPGETARGS} ${SWITCHIP}:161 ${OIDVLAN}${PORT}`
+                VLAN=`echo $VLANRAW | rev | cut -d: -f1 | rev`
+        fi
+
+        if [[ $BASHFRIENDLY == 1 ]]
+        then
+                if [[ $GETADMIN == 1 ]]
+                then
+                        echo "AdminStatus $ADMINSTATUS"
+                fi
+                if [[ $GETOPER == 1 ]]
+                then
+                        echo "OperStatus $OPERSTATUS"
+                fi
+                if [[ $GETINTRUSION == 1 ]]
+                then
+                        echo "IntrusionFlag $INTRUSIONFLAG"
+                fi
+                if [[ $GETSPEED == 1 ]]
+                then
+                        echo "Speed $SPEED"
+                fi
+                if [[ $GETVLAN == 1 ]]
+                then
+                        echo "VLAN$VLAN"
+                fi
+        else
+                if [[ $GETADMIN == 1 ]]
+                then
+                        echo -e " | AdminStatus:   $ADMINSTATUS"
+                fi
+                if [[ $GETOPER == 1 ]]
+                then
+                        echo -e " | OperStatus:    $OPERSTATUS"
+                fi
+                if [[ $GETINTRUSION == 1 ]]
+                then
+                        echo -e " | IntrusionFlag: $INTRUSIONFLAG"
+                fi
+                if [[ $GETSPEED == 1 ]]
+                then
+                        echo -e " | Oper Speed:    $SPEED"
+                        echo -e " | Admin Speed:   $ADMINSPEED"
+                fi
+                if [[ $GETVLAN == 1 ]]
+                then
+                        echo -e " | VLAN:         $VLAN"
+                fi
+        fi
+
+
+}
+
+while getopts "i:m:g:n:fhs:p:a:b" OPTION
+do
+     case $OPTION in
+         i)
+             IPADDR=$OPTARG
+             ;;
+         m)
+             MACADDR=`echo $OPTARG | sed s'/-/:/'g | awk '{print toupper($0)}'`
+             ;;
+         n)
+             NEWVLAN=$OPTARG
+             ;;
+         h)
+             usage
+             exit 1
+             ;;
+         s)
+             SWITCH=$OPTARG
+             ;;
+         b)
+             BASHFRIENDLY=1
+             ;;
+         f)
+             FORCE=1
+             ;;
+         p)
+             PORT=$OPTARG
+             ;;
+         g)
+             NEWSPEEDWORD=$OPTARG
+             ;;
+         a)
+             ACTION=$OPTARG
+             ;;
+         ?)
+             usage
+             exit
+             ;;
+     esac
+done
+
+if [[ $ACTION -ne "searchMAC" ]]
+  then
+  if [[ -z $SWITCH ]] || [[ -z $PORT ]] || [[ -z $ACTION ]]
+   then
+       usage
+       echo ""
+       echo "Illegal arguments!"
+       exit 1
+  fi
+fi
+
+# ACTION start
+
+# First we are getting the ip for the switches
+# We use the definitions above for that
+# GIT: EDIT HERE (add your switch names)
+case $SWITCH in
+        swSample1)
+                SWITCHIP=$SWSAMPLE1
+                ;;
+        swSample2)
+                SWITCHIP=$SWSAMPLE2
+                ;;
+esac
+
+if [[ "$ACTION" == "search"* ]] || [[ "$ACTION" == "ipToMAC" ]]; then
+ SWITCH="?"
+ SWITCHIP="?"
+ PORT="?"
+else
+    # Now SWITCHIP holds the IP of the Switch,
+    # if it exists. If the switch from the args
+    # is invalid, the SWTICHIP is empty.
+    if [[ -z $SWITCHIP ]]
+    then
+         echo "There is no Switch with the name $SWITCH"
+         echo "Exit."
+         exit 0
+    fi
+
+    # Checking if the given ACTION is a valid action
+    if [[ $ACTION != "getState" ]] && [[ $ACTION != "up" ]] && [[ $ACTION != "down" ]] && [[ $ACTION != "setFlag" ]] && [[ $ACTION != "unSetFlag" ]] && [[ $ACTION != "setVLAN" ]] && [[ $ACTION != "setSpeed" ]] && [[ $ACTION != "searchMAC" ]]
+    then
+            echo "There is no action called $ACTION (Check Upper/Lowecase)"
+            echo "Exit."
+            exit 0
+    fi
+
+    if [[ "$PORT" -ge 49 ]] || [[ "$PORT" -le 0 ]]
+    then
+            echo "Port has to be in range of [1..48]. Port $PORT is not!"
+            echo "Exit."
+            exit 0
+    fi
+
+    # This will add a nice Mbit/s prefix, if the Speed action was chosen
+    if [[ -n $NEWSPEEDWORD ]]; then
+            NEWSPEEDWORDPREFIX="Mbit/s"
+    fi
+fi
+
+# If BASHFRIENDLY=1 the script will only print the data at predefined places.
+# This can be very handy if the script is run by the management server (later)
+if [[ $BASHFRIENDLY != 1 ]]
+then
+cat << EOF
+ramnet HP ProCurve 2484 switch manager
+              version $VERSION
+
+Switch: $SWITCH (IP: $SWITCHIP)
+Port:   $PORT
+Action: $ACTION ${NEWVLAN}${NEWSPEEDWORD}${NEWSPEEDWORDPREFIX}${MACADDR}${IPADDR}
+--------------------------------------
+EOF
+fi
+
+case $ACTION in
+        getState)
+                GETADMIN=1
+                GETOPER=1
+                GETSPEED=1
+                GETVLAN=1
+                GETINTRUSION=1
+                getPortState
+                ;;
+        up)
+                SHOWCURRENT=1
+                setPortUp
+                ;;
+        down)
+                SHOWCURRENT=1
+                setPortDown
+                ;;
+        unSetFlag)
+                unSetFlag
+                ;;
+        setFlag)
+                echo "Sorry, an intrusion flags cannot be set! (HP Device specific)"
+                echo "Exit."
+                exit 0
+                setFlag
+                ;;
+        setVLAN)
+                setVLAN
+                ;;
+        setSpeed)
+                setSpeed
+                ;;
+        searchMAC)
+                searchMAC
+                ;;
+        searchIP)
+                searchIP
+                ;;
+        ipToMAC)
+                ipToMAC $IPADDR
+                ;;
+
+
+esac
+exit 1
